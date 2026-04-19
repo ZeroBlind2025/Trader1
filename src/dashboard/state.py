@@ -32,10 +32,32 @@ class DashboardState:
         self.halted = False
         self.halt_reason: str | None = None
         self._logs: Deque[LogLine] = deque(maxlen=log_capacity)
+        self.backtest_status: str = "idle"  # idle | running | done | error
+        self.backtest_summary: Dict[str, str] = {}
+        self.backtest_error: str | None = None
 
     def add_log(self, ts: datetime, level: str, msg: str) -> None:
         with self._lock:
             self._logs.append(LogLine(ts, level, msg))
+
+    def set_backtest_status(self, status: str, error: str | None = None) -> None:
+        with self._lock:
+            self.backtest_status = status
+            self.backtest_error = error
+
+    def set_backtest_summary(self, summary: Dict[str, str]) -> None:
+        with self._lock:
+            self.backtest_summary = dict(summary)
+            self.backtest_status = "done"
+            self.backtest_error = None
+
+    def get_backtest(self) -> Dict:
+        with self._lock:
+            return {
+                "status": self.backtest_status,
+                "summary": dict(self.backtest_summary),
+                "error": self.backtest_error,
+            }
 
     def logs(self) -> List[LogLine]:
         with self._lock:
