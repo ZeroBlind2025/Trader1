@@ -35,8 +35,32 @@ class BacktestResult:
     sharpe: float
     win_rate: float
     num_trades: int
+    wins: int
+    losses: int
+    wl_ratio: float
+    total_cost: float
+    total_sale: float
+    total_pnl: float
     equity_curve: pd.Series
     trades: List[dict] = field(default_factory=list)
+
+    def summary(self) -> Dict[str, str]:
+        """Human-readable one-line-per-metric summary for the dashboard grid."""
+        wl = f"{self.wl_ratio:.2f}" if self.losses else ("∞" if self.wins else "0.00")
+        return {
+            "Trades Entered": f"{self.num_trades}",
+            "Wins/Losses": f"{self.wins}/{self.losses}",
+            "W/L Ratio": wl,
+            "Win Rate": f"{self.win_rate * 100:.1f}%",
+            "Total Cost": f"${self.total_cost:,.2f}",
+            "Total Sale": f"${self.total_sale:,.2f}",
+            "Total PnL": f"${self.total_pnl:,.2f}",
+            "Total Return": f"{self.total_return_pct * 100:.2f}%",
+            "CAGR": f"{self.cagr_pct * 100:.2f}%",
+            "Max DD": f"{self.max_drawdown_pct * 100:.2f}%",
+            "Sharpe": f"{self.sharpe:.2f}",
+            "Ending Equity": f"${self.ending_equity:,.2f}",
+        }
 
 
 def _annualised_sharpe(equity: pd.Series) -> float:
@@ -159,7 +183,12 @@ def run_backtest(
     cagr = (curve.iloc[-1] / starting_equity) ** (1 / years_actual) - 1 if starting_equity else 0
     trades = broker.trade_history()
     wins = sum(1 for t in trades if t.pnl > 0)
+    losses = sum(1 for t in trades if t.pnl <= 0)
     win_rate = wins / len(trades) if trades else 0.0
+    wl_ratio = (wins / losses) if losses else float(wins)
+    total_cost = float(sum(t.entry_price * t.qty for t in trades))
+    total_sale = float(sum(t.exit_price * t.qty for t in trades))
+    total_pnl = float(sum(t.pnl for t in trades))
 
     return BacktestResult(
         starting_equity=starting_equity,
@@ -170,6 +199,12 @@ def run_backtest(
         sharpe=_annualised_sharpe(curve),
         win_rate=win_rate,
         num_trades=len(trades),
+        wins=wins,
+        losses=losses,
+        wl_ratio=wl_ratio,
+        total_cost=total_cost,
+        total_sale=total_sale,
+        total_pnl=total_pnl,
         equity_curve=curve,
         trades=[t.as_row() for t in trades],
     )
