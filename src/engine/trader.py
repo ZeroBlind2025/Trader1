@@ -18,6 +18,7 @@ import pytz
 from config import RISK, RUNTIME, STRATEGY, UNIVERSE
 from src.broker.base import Broker
 from src.data import feed
+from src.engine.market_hours import is_market_open, next_open
 from src.risk.manager import RiskManager
 from src.strategy import scoring
 from src.strategy.scoring import Signal
@@ -53,16 +54,12 @@ class Trader:
             last = df.iloc[-1]
             price = float(last["close"])
             prices[sym] = price
-            # Update high since entry first
             if price > pos.high_since_entry:
                 pos.high_since_entry = price
-            # ATR approximation from recent ATR, fall back to entry ATR
             atr_val = pos.atr_at_entry
-            # Trail
             pos.stop_price = RiskManager.update_trailing_stop(
                 pos.stop_price, pos.high_since_entry, atr_val, pos.trail_mult
             )
-            # Exit checks
             if price <= pos.stop_price:
                 to_close.append((sym, price, "stop/trail"))
             elif price >= pos.take_profit:
@@ -70,7 +67,6 @@ class Trader:
             elif RiskManager.is_dead(pos.entry_time, now, pos.entry_price, price):
                 to_close.append((sym, price, "time-stop"))
 
-        # Mark-to-market everything before closing
         self.broker.mark(prices, timestamp=now)
 
         for sym, px, reason in to_close:
@@ -94,7 +90,6 @@ class Trader:
             sig = scoring.evaluate(sym, df)
             if sig and sig.enter:
                 signals.append(sig)
-        # Rank by score desc, ADX as tie-breaker
         signals.sort(key=lambda s: (s.score, s.adx), reverse=True)
         return signals
 
@@ -124,6 +119,16 @@ class Trader:
     # -- public tick -------------------------------------------------------
     def tick(self) -> None:
         now = self._now()
+        if not is_market_open(now):
+            nxt = next_open(now)
+            self._log(
+                f"Market closed ({now:%a %H:%M %Z}); next open {nxt:%a %Y-%m-%d %H:%M %Z}. "
+                "Skipping scan.",
+                "INFO",
+            )
+            self._push_state()
+            return
+
         self._log(f"Scan tick @ {now:%H:%M:%S} equity=${self.broker.equity():,.2f}")
 
         data = feed.fetch_batch(UNIVERSE, interval=STRATEGY.candle_interval, period="60d")

@@ -44,12 +44,13 @@ class RiskManager:
             return None
         risk_dollars = equity * RISK.portfolio_risk_pct
         stop_distance = RISK.atr_stop_mult * atr
-        qty = math.floor(risk_dollars / stop_distance)
-        if qty <= 0:
-            return None
-        # Don't buy more than equity allows (no margin)
-        max_qty_by_cash = math.floor(equity / price)
-        qty = min(qty, max_qty_by_cash)
+        qty_by_risk = math.floor(risk_dollars / stop_distance)
+        # Notional cap so one low-ATR ticker can't swallow the whole book.
+        notional_cap = equity * RISK.max_position_notional_pct
+        qty_by_notional = math.floor(notional_cap / price)
+        # Hard cash cap (no margin)
+        qty_by_cash = math.floor(equity / price)
+        qty = min(qty_by_risk, qty_by_notional, qty_by_cash)
         if qty <= 0:
             return None
 

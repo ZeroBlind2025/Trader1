@@ -87,13 +87,14 @@ class StrategyConfig:
 
 @dataclass(frozen=True)
 class RiskConfig:
-    portfolio_risk_pct: float = 0.06           # 6% per trade
+    portfolio_risk_pct: float = 0.06           # 6% per trade (loss ceiling)
     atr_stop_mult: float = 1.0                 # initial stop = 1x ATR
     trail_mult_low_vol: float = 1.8            # tight trail in calm tape
     trail_mult_high_vol: float = 2.5           # wide trail when ATR% elevated
     vol_regime_atr_pct: float = 0.03           # >3% ATR/price => high vol
     take_profit_mult: float = 3.0              # 3x ATR target
     max_concurrent_positions: int = 3
+    max_position_notional_pct: float = 0.33    # <= equity / max_positions per name
     max_drawdown_pct: float = 0.15             # 15% circuit breaker
     time_stop_minutes: int = 90                # kill dead positions
 
