@@ -9,9 +9,10 @@ alternate data source.
 from __future__ import annotations
 
 import logging
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
-from typing import Dict, List
+from typing import Callable, Dict, List, Optional
 
 import numpy as np
 import pandas as pd
@@ -82,30 +83,80 @@ def run_backtest(
     years: int = 5,
     interval: str = "1d",
     universe: List[str] | None = None,
+    progress_cb: Optional[Callable[[str], None]] = None,
 ) -> BacktestResult:
+    def _emit(msg: str) -> None:
+        log.info(msg)
+        if progress_cb is not None:
+            try:
+                progress_cb(msg)
+            except Exception:  # noqa: BLE001
+                pass
+
     universe = universe or UNIVERSE
     end = datetime.utcnow()
     start = end - timedelta(days=years * 365 + 30)
 
-    log.info("Loading %d symbols from %s to %s (%s)", len(universe), start.date(), end.date(), interval)
+    _emit(f"Fetching {len(universe)} symbols from {start.date()} to {end.date()} ({interval})")
     raw: Dict[str, pd.DataFrame] = {}
-    for sym in universe:
-        df = feed.fetch_history(sym, start, end, interval=interval)
+    fetch_failures: List[str] = []
+    t0 = time.time()
+    for i, sym in enumerate(universe, 1):
+        try:
+            df = feed.fetch_history(sym, start, end, interval=interval)
+        except Exception as exc:  # noqa: BLE001
+            fetch_failures.append(f"{sym}: {exc}")
+            continue
         if not df.empty and len(df) > STRATEGY.ema_trend + 20:
             raw[sym] = df
+        if i % 10 == 0 or i == len(universe):
+            _emit(f"  fetched {i}/{len(universe)} ({len(raw)} usable, {len(fetch_failures)} errors)")
 
+    if fetch_failures:
+        _emit(f"Fetch errors on {len(fetch_failures)} symbols (first: {fetch_failures[0]})")
     if not raw:
-        raise RuntimeError("No historical data loaded — check network / yfinance access")
+        raise RuntimeError(
+            f"No historical data loaded — all {len(universe)} fetches failed "
+            f"(first error: {fetch_failures[0] if fetch_failures else 'empty frames'})"
+        )
 
-    # Build a master calendar from the union of indexes
-    calendar = sorted({ts for df in raw.values() for ts in df.index})
+    _emit(f"Pre-computing indicators for {len(raw)} symbols…")
+    enriched: Dict[str, pd.DataFrame] = {}
+    for sym, df in raw.items():
+        try:
+            enriched[sym] = scoring._enrich(df)
+        except Exception as exc:  # noqa: BLE001
+            _emit(f"  enrich failed for {sym}: {exc}")
+    if not enriched:
+        raise RuntimeError("Indicator pre-compute produced no usable frames")
+
+    calendar = sorted({ts for df in enriched.values() for ts in df.index})
+    _emit(
+        f"Simulating {len(calendar):,} bars across {len(enriched)} symbols "
+        f"(fetch+enrich took {time.time() - t0:.1f}s)"
+    )
 
     broker = PaperBroker(starting_equity)
     risk = RiskManager(starting_equity)
 
-    for ts in calendar:
+    total_bars = len(calendar)
+    checkpoint = max(total_bars // 20, 1)  # ~5% progress pings
+    t_sim = time.time()
+
+    for bar_idx, ts in enumerate(calendar):
+        if bar_idx and bar_idx % checkpoint == 0:
+            elapsed = time.time() - t_sim
+            pct = 100 * bar_idx / total_bars
+            rate = bar_idx / elapsed if elapsed else 0
+            eta = (total_bars - bar_idx) / rate if rate else 0
+            _emit(
+                f"  sim {bar_idx:,}/{total_bars:,} bars ({pct:.0f}%) — "
+                f"eq=${broker.equity():,.0f} trades={broker.resolved_trade_count()} "
+                f"eta {eta:.0f}s"
+            )
+
         today_prices: Dict[str, float] = {}
-        for sym, df in raw.items():
+        for sym, df in enriched.items():
             if ts in df.index:
                 px = float(df.loc[ts, "close"])
                 if pd.notna(px):
@@ -147,7 +198,7 @@ def run_backtest(
             continue
 
         candidates = []
-        for sym, df in raw.items():
+        for sym, df in enriched.items():
             if sym in broker.positions():
                 continue
             sub = df.loc[:ts]
