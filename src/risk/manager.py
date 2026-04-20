@@ -40,16 +40,33 @@ class RiskManager:
 
     # --- Sizing ------------------------------------------------------------
     def size_position(self, equity: float, price: float, atr: float) -> SizingResult | None:
+        """Vol-target sizing: each position contributes ~equal $-vol per ATR.
+
+        Primary sizer is ``target_vol_pct`` (dollar volatility budget per unit
+        ATR). Three caps ride on top: portfolio_risk_pct (disaster stop loss
+        ceiling), max_position_notional_pct (concentration cap), and cash.
+        """
         if atr <= 0 or price <= 0:
             return None
-        risk_dollars = equity * RISK.portfolio_risk_pct
+
+        # Primary: vol-target — size so stop-distance move = target_vol_pct of equity
+        # independent of trade count, letting low-ATR names take larger notional.
+        target_vol_dollars = equity * RISK.target_vol_pct
+        qty_by_vol = math.floor(target_vol_dollars / atr)
+
+        # Cap 1: hard loss ceiling if stopped at atr_stop_mult * ATR
         stop_distance = RISK.atr_stop_mult * atr
-        qty = math.floor(risk_dollars / stop_distance)
-        if qty <= 0:
-            return None
-        # Don't buy more than equity allows (no margin)
-        max_qty_by_cash = math.floor(equity / price)
-        qty = min(qty, max_qty_by_cash)
+        risk_dollars = equity * RISK.portfolio_risk_pct
+        qty_by_risk = math.floor(risk_dollars / stop_distance)
+
+        # Cap 2: notional concentration per name
+        notional_cap = equity * RISK.max_position_notional_pct
+        qty_by_notional = math.floor(notional_cap / price)
+
+        # Cap 3: cash on hand (no margin)
+        qty_by_cash = math.floor(equity / price)
+
+        qty = min(qty_by_vol, qty_by_risk, qty_by_notional, qty_by_cash)
         if qty <= 0:
             return None
 
@@ -76,9 +93,21 @@ class RiskManager:
 
     # --- Time-stop ---------------------------------------------------------
     @staticmethod
-    def is_dead(entry_time: datetime, now: datetime, entry_price: float, current_price: float) -> bool:
-        if now - entry_time < timedelta(minutes=RISK.time_stop_minutes):
+    def is_dead(
+        entry_time: datetime,
+        now: datetime,
+        entry_price: float,
+        current_price: float,
+        bar_minutes: int = 15,
+    ) -> bool:
+        """Kill a position that's gone nowhere after time_stop_bars bars.
+
+        ``bar_minutes`` scales the window to the caller's timeframe — live
+        trader passes 15 (15m bars), backtester passes 1440 for daily bars,
+        so the rule stays meaningful across timeframes.
+        """
+        window = timedelta(minutes=RISK.time_stop_bars * bar_minutes)
+        if now - entry_time < window:
             return False
         move = abs(current_price - entry_price) / entry_price if entry_price else 0.0
-        # Dead if after N minutes it hasn't moved more than 0.5%
-        return move < 0.005
+        return move < RISK.time_stop_min_move_pct

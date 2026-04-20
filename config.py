@@ -87,15 +87,24 @@ class StrategyConfig:
 
 @dataclass(frozen=True)
 class RiskConfig:
-    portfolio_risk_pct: float = 0.06           # 6% per trade
-    atr_stop_mult: float = 1.0                 # initial stop = 1x ATR
-    trail_mult_low_vol: float = 1.8            # tight trail in calm tape
-    trail_mult_high_vol: float = 2.5           # wide trail when ATR% elevated
+    # Sizing
+    target_vol_pct: float = 0.01               # target $vol per ATR = 1% of equity
+    portfolio_risk_pct: float = 0.08           # hard loss ceiling per trade
+    atr_stop_mult: float = 1.5                 # initial stop = 1.5x ATR (give room)
+    # Trailing stop — widened so winners breathe
+    trail_mult_low_vol: float = 2.5            # was 1.8
+    trail_mult_high_vol: float = 3.5           # was 2.5
     vol_regime_atr_pct: float = 0.03           # >3% ATR/price => high vol
-    take_profit_mult: float = 3.0              # 3x ATR target
+    take_profit_mult: float = 3.5              # 3.5x ATR target (was 3.0)
     max_concurrent_positions: int = 3
+    max_position_notional_pct: float = 0.33    # <= equity / max_positions per name
     max_drawdown_pct: float = 0.15             # 15% circuit breaker
-    time_stop_minutes: int = 90                # kill dead positions
+    # Time-stop — bar-aware so daily backtests don't fire every bar
+    time_stop_bars: int = 8                    # check inactivity after N bars
+    time_stop_min_move_pct: float = 0.015      # kill if move < 1.5% after window
+    # Regime overlay: block new entries when SPY < 200D SMA
+    regime_symbol: str = "SPY"
+    regime_sma_period: int = 200
 
 
 @dataclass(frozen=True)

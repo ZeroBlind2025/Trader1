@@ -40,6 +40,8 @@ class Signal:
 
 def _enrich(df: pd.DataFrame) -> pd.DataFrame:
     """Attach all indicator columns to the dataframe."""
+    if "ema_trend" in df.columns and "macd_hist" in df.columns:
+        return df  # already enriched — avoid quadratic work in backtests
     out = df.copy()
     out["ema_fast"] = ind.ema(out["close"], STRATEGY.ema_fast)
     out["ema_mid"] = ind.ema(out["close"], STRATEGY.ema_mid)

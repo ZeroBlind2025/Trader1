@@ -1,14 +1,33 @@
 """Dash dashboard: equity curve, open positions, trade history, log feed."""
 from __future__ import annotations
 
+import logging
+import threading
+from datetime import datetime
 from typing import Dict
 
 import dash
 import pandas as pd
 import plotly.graph_objects as go
-from dash import Input, Output, dash_table, dcc, html
+from dash import Input, Output, State, dash_table, dcc, html, no_update
 
 from .state import DashboardState
+
+log = logging.getLogger(__name__)
+
+
+class _DashboardLogHandler(logging.Handler):
+    """Route log records emitted during the backtest into the dashboard feed."""
+
+    def __init__(self, state: DashboardState) -> None:
+        super().__init__(level=logging.INFO)
+        self._state = state
+
+    def emit(self, record: logging.LogRecord) -> None:  # pragma: no cover - UI glue
+        try:
+            self._state.add_log(datetime.utcnow(), record.levelname, self.format(record))
+        except Exception:  # noqa: BLE001
+            pass
 
 DARK_BG = "#0e1117"
 CARD_BG = "#161b22"
@@ -102,6 +121,50 @@ def build_app(state: DashboardState) -> dash.Dash:
                             ),
                         ],
                     ),
+                ],
+            ),
+            # -------- BACKTEST ROW --------
+            html.Div(
+                style={
+                    "backgroundColor": CARD_BG,
+                    "padding": "12px",
+                    "borderRadius": "8px",
+                    "marginTop": "12px",
+                },
+                children=[
+                    html.Div(
+                        style={
+                            "display": "flex",
+                            "alignItems": "center",
+                            "justifyContent": "space-between",
+                            "marginBottom": "8px",
+                        },
+                        children=[
+                            html.H4("5-Year Backtest", style={"margin": 0}),
+                            html.Div(
+                                style={"display": "flex", "alignItems": "center", "gap": "12px"},
+                                children=[
+                                    html.Span(id="backtest-status", style={"color": MUTED, "fontSize": "12px"}),
+                                    html.Button(
+                                        "Run Backtest",
+                                        id="run-backtest-btn",
+                                        n_clicks=0,
+                                        style={
+                                            "backgroundColor": ACCENT,
+                                            "color": "#0e1117",
+                                            "border": "none",
+                                            "padding": "8px 18px",
+                                            "borderRadius": "6px",
+                                            "fontWeight": 700,
+                                            "fontFamily": "JetBrains Mono, monospace",
+                                            "cursor": "pointer",
+                                        },
+                                    ),
+                                ],
+                            ),
+                        ],
+                    ),
+                    html.Div(id="backtest-grid"),
                 ],
             ),
             dcc.Interval(id="tick", interval=2_000, n_intervals=0),
@@ -222,6 +285,134 @@ def build_app(state: DashboardState) -> dash.Dash:
             return html.Div("No closed trades yet", style={"color": MUTED, "padding": "24px 0"})
         df = pd.DataFrame(rows)
         return _table(df, pnl_cols=["pnl_usd", "pnl_pct"])
+
+    def _run_backtest_async() -> None:
+        """Daemon-thread worker. Imports lazily so Dash startup stays cheap."""
+        from src.backtest.runner import run_backtest
+
+        state.set_backtest_status("running")
+        state.add_log(datetime.utcnow(), "INFO", "Backtest starting…")
+
+        # Capture the runner's logs into the dashboard feed for the duration.
+        handler = _DashboardLogHandler(state)
+        handler.setFormatter(logging.Formatter("%(name)s: %(message)s"))
+        runner_log = logging.getLogger("src.backtest.runner")
+        scoring_log = logging.getLogger("src.strategy.scoring")
+        runner_log.addHandler(handler)
+        scoring_log.addHandler(handler)
+        runner_log.setLevel(logging.INFO)
+
+        def _progress(msg: str) -> None:
+            state.add_log(datetime.utcnow(), "INFO", msg)
+
+        try:
+            result = run_backtest(
+                starting_equity=state.starting_equity or 100_000.0,
+                progress_cb=_progress,
+            )
+            state.set_backtest_summary(result.summary())
+            state.add_log(
+                datetime.utcnow(),
+                "INFO",
+                f"Backtest complete: {result.num_trades} trades, "
+                f"ending=${result.ending_equity:,.0f}",
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.exception("Backtest failed")
+            state.set_backtest_status("error", error=str(exc))
+            state.add_log(datetime.utcnow(), "ERROR", f"Backtest failed: {exc}")
+        finally:
+            runner_log.removeHandler(handler)
+            scoring_log.removeHandler(handler)
+
+    @app.callback(
+        Output("run-backtest-btn", "disabled"),
+        Input("run-backtest-btn", "n_clicks"),
+        prevent_initial_call=True,
+    )
+    def _on_run_backtest(n_clicks):
+        if not n_clicks:
+            return no_update
+        current = state.get_backtest()["status"]
+        if current == "running":
+            return True
+        threading.Thread(target=_run_backtest_async, daemon=True).start()
+        return True
+
+    @app.callback(
+        Output("backtest-grid", "children"),
+        Output("backtest-status", "children"),
+        Output("run-backtest-btn", "disabled", allow_duplicate=True),
+        Input("tick", "n_intervals"),
+        prevent_initial_call="initial_duplicate",
+    )
+    def _update_backtest(_):
+        bt = state.get_backtest()
+        status = bt["status"]
+        summary = bt["summary"]
+        disabled = status == "running"
+
+        if status == "idle":
+            label = "Click Run Backtest to execute a 5-year sim"
+        elif status == "running":
+            label = "Running backtest… (this can take 30-90s)"
+        elif status == "error":
+            label = f"Error: {bt['error']}"
+        else:
+            label = "Last run complete"
+
+        if not summary:
+            grid = html.Div(
+                "No backtest results yet",
+                style={"color": MUTED, "padding": "16px 0"},
+            )
+        else:
+            cells = []
+            for name, value in summary.items():
+                color = "#e6edf3"
+                if name in ("Total PnL", "Total Return", "CAGR"):
+                    raw = value.replace("$", "").replace(",", "").replace("%", "").strip()
+                    try:
+                        color = ACCENT if float(raw) >= 0 else DANGER
+                    except ValueError:
+                        color = "#e6edf3"
+                elif name == "Max DD":
+                    color = DANGER
+                cells.append(
+                    html.Div(
+                        style={
+                            "backgroundColor": "#1f2630",
+                            "padding": "10px 12px",
+                            "borderRadius": "6px",
+                            "border": "1px solid #222",
+                        },
+                        children=[
+                            html.Div(
+                                name,
+                                style={
+                                    "color": MUTED,
+                                    "fontSize": "10px",
+                                    "textTransform": "uppercase",
+                                    "letterSpacing": "0.5px",
+                                },
+                            ),
+                            html.Div(
+                                value,
+                                style={"color": color, "fontSize": "18px", "fontWeight": 700, "marginTop": "4px"},
+                            ),
+                        ],
+                    )
+                )
+            grid = html.Div(
+                cells,
+                style={
+                    "display": "grid",
+                    "gridTemplateColumns": "repeat(6, 1fr)",
+                    "gap": "8px",
+                },
+            )
+
+        return grid, label, disabled
 
     @app.callback(Output("log-feed", "children"), Input("tick", "n_intervals"))
     def _update_logs(_):
