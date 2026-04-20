@@ -20,8 +20,12 @@ import pandas as pd
 from config import RISK, STRATEGY, UNIVERSE
 from src.broker.paper import PaperBroker
 from src.data import feed
+from src.engine.regime import RegimeFilter
 from src.risk.manager import RiskManager
 from src.strategy import scoring
+
+
+_BAR_MINUTES = {"1m": 1, "5m": 5, "15m": 15, "30m": 30, "60m": 60, "1h": 60, "1d": 1440, "1wk": 10080}
 
 log = logging.getLogger(__name__)
 
@@ -130,6 +134,20 @@ def run_backtest(
     if not enriched:
         raise RuntimeError("Indicator pre-compute produced no usable frames")
 
+    # Regime filter — fetch SPY on daily bars regardless of backtest interval,
+    # so the 200-day SMA is always meaningful.
+    regime_df = pd.DataFrame()
+    try:
+        regime_df = feed.fetch_history(RISK.regime_symbol, start, end, interval="1d")
+    except Exception as exc:  # noqa: BLE001
+        _emit(f"  regime fetch failed ({RISK.regime_symbol}: {exc}) — running without regime filter")
+    regime = RegimeFilter(regime_df)
+    _emit(
+        f"Regime: {RISK.regime_symbol} {RISK.regime_sma_period}D SMA "
+        f"({'loaded' if regime.has_data() else 'disabled — no data'})"
+    )
+    bar_minutes = _BAR_MINUTES.get(interval, 1440)
+
     calendar = sorted({ts for df in enriched.values() for ts in df.index})
     _emit(
         f"Simulating {len(calendar):,} bars across {len(enriched)} symbols "
@@ -178,7 +196,9 @@ def run_backtest(
                 reason = "stop/trail"
             elif price >= pos.take_profit:
                 reason = "take-profit"
-            elif RiskManager.is_dead(pos.entry_time, ts, pos.entry_price, price):
+            elif RiskManager.is_dead(
+                pos.entry_time, ts, pos.entry_price, price, bar_minutes=bar_minutes
+            ):
                 reason = "time-stop"
             if reason:
                 broker.sell(sym, price, reason, timestamp=ts)
@@ -190,6 +210,10 @@ def run_backtest(
                             "halt", timestamp=ts)
             risk.halted = False
             risk.peak_equity = broker.equity()
+            continue
+
+        # --- regime overlay: block new entries when SPY < 200D ---
+        if not regime.is_bull(ts):
             continue
 
         # --- scan entries ---
