@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import logging
 import threading
+from datetime import datetime
 from typing import Dict
 
 import dash
@@ -13,6 +14,20 @@ from dash import Input, Output, State, dash_table, dcc, html, no_update
 from .state import DashboardState
 
 log = logging.getLogger(__name__)
+
+
+class _DashboardLogHandler(logging.Handler):
+    """Route log records emitted during the backtest into the dashboard feed."""
+
+    def __init__(self, state: DashboardState) -> None:
+        super().__init__(level=logging.INFO)
+        self._state = state
+
+    def emit(self, record: logging.LogRecord) -> None:  # pragma: no cover - UI glue
+        try:
+            self._state.add_log(datetime.utcnow(), record.levelname, self.format(record))
+        except Exception:  # noqa: BLE001
+            pass
 
 DARK_BG = "#0e1117"
 CARD_BG = "#161b22"
@@ -276,12 +291,39 @@ def build_app(state: DashboardState) -> dash.Dash:
         from src.backtest.runner import run_backtest
 
         state.set_backtest_status("running")
+        state.add_log(datetime.utcnow(), "INFO", "Backtest starting…")
+
+        # Capture the runner's logs into the dashboard feed for the duration.
+        handler = _DashboardLogHandler(state)
+        handler.setFormatter(logging.Formatter("%(name)s: %(message)s"))
+        runner_log = logging.getLogger("src.backtest.runner")
+        scoring_log = logging.getLogger("src.strategy.scoring")
+        runner_log.addHandler(handler)
+        scoring_log.addHandler(handler)
+        runner_log.setLevel(logging.INFO)
+
+        def _progress(msg: str) -> None:
+            state.add_log(datetime.utcnow(), "INFO", msg)
+
         try:
-            result = run_backtest(starting_equity=state.starting_equity or 100_000.0)
+            result = run_backtest(
+                starting_equity=state.starting_equity or 100_000.0,
+                progress_cb=_progress,
+            )
             state.set_backtest_summary(result.summary())
+            state.add_log(
+                datetime.utcnow(),
+                "INFO",
+                f"Backtest complete: {result.num_trades} trades, "
+                f"ending=${result.ending_equity:,.0f}",
+            )
         except Exception as exc:  # noqa: BLE001
             log.exception("Backtest failed")
             state.set_backtest_status("error", error=str(exc))
+            state.add_log(datetime.utcnow(), "ERROR", f"Backtest failed: {exc}")
+        finally:
+            runner_log.removeHandler(handler)
+            scoring_log.removeHandler(handler)
 
     @app.callback(
         Output("run-backtest-btn", "disabled"),

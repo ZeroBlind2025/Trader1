@@ -9,8 +9,8 @@ Every ``STRATEGY.scan_interval_minutes`` minutes:
 from __future__ import annotations
 
 import logging
-from datetime import datetime
-from typing import Dict, List
+from datetime import datetime, timedelta
+from typing import Dict, List, Optional
 
 import pandas as pd
 import pytz
@@ -19,9 +19,16 @@ from config import RISK, RUNTIME, STRATEGY, UNIVERSE
 from src.broker.base import Broker
 from src.data import feed
 from src.engine.market_hours import is_market_open, next_open
+from src.engine.regime import RegimeFilter
 from src.risk.manager import RiskManager
 from src.strategy import scoring
 from src.strategy.scoring import Signal
+
+
+def _bar_minutes(interval: str) -> int:
+    """Translate a yfinance-style interval string to minutes."""
+    mapping = {"1m": 1, "5m": 5, "15m": 15, "30m": 30, "60m": 60, "1h": 60, "1d": 1440}
+    return mapping.get(interval, 15)
 
 log = logging.getLogger(__name__)
 
@@ -31,6 +38,42 @@ class Trader:
         self.broker = broker
         self.risk = risk
         self.state = dashboard_state  # optional shared dashboard state
+        self._bar_minutes = _bar_minutes(STRATEGY.candle_interval)
+        self._regime: RegimeFilter = RegimeFilter()  # primed on first tick
+        self._regime_refreshed_at: Optional[datetime] = None
+        self._last_regime_bull: Optional[bool] = None
+
+    # -- regime ------------------------------------------------------------
+    def _refresh_regime(self, force: bool = False) -> None:
+        """Reload SPY daily history if we've never loaded or it's >12h stale."""
+        now = self._now()
+        if (
+            not force
+            and self._regime_refreshed_at is not None
+            and now - self._regime_refreshed_at < timedelta(hours=12)
+        ):
+            return
+        end = datetime.utcnow()
+        start = end - timedelta(days=RISK.regime_sma_period * 2)
+        try:
+            df = feed.fetch_history(RISK.regime_symbol, start, end, interval="1d")
+        except Exception as exc:  # noqa: BLE001
+            self._log(f"Regime fetch failed ({RISK.regime_symbol}: {exc})", "WARNING")
+            return
+        self._regime = RegimeFilter(df)
+        self._regime_refreshed_at = now
+        snap = self._regime.snapshot()
+        if snap.get("bull") is False:
+            self._log(
+                f"Regime: BEARISH — {RISK.regime_symbol} {snap['spot']:.2f} < "
+                f"{RISK.regime_sma_period}D SMA {snap['sma']:.2f}; entries blocked",
+                "WARNING",
+            )
+        elif self._regime.has_data():
+            self._log(
+                f"Regime: BULLISH — {RISK.regime_symbol} {snap['spot']:.2f} >= "
+                f"{RISK.regime_sma_period}D SMA {snap['sma']:.2f}"
+            )
 
     # -- helpers -----------------------------------------------------------
     def _now(self) -> datetime:
@@ -64,7 +107,9 @@ class Trader:
                 to_close.append((sym, price, "stop/trail"))
             elif price >= pos.take_profit:
                 to_close.append((sym, price, "take-profit"))
-            elif RiskManager.is_dead(pos.entry_time, now, pos.entry_price, price):
+            elif RiskManager.is_dead(
+                pos.entry_time, now, pos.entry_price, price, bar_minutes=self._bar_minutes
+            ):
                 to_close.append((sym, price, "time-stop"))
 
         self.broker.mark(prices, timestamp=now)
@@ -146,6 +191,22 @@ class Trader:
 
         open_count = len(self.broker.positions())
         if not self.risk.can_trade(open_count):
+            self._push_state()
+            return
+
+        # Regime gate: block new entries in bearish regime but keep managing exits.
+        self._refresh_regime()
+        bull = self._regime.is_bull()
+        if bull != self._last_regime_bull and self._regime.has_data():
+            # Log on flip only.
+            snap = self._regime.snapshot()
+            self._log(
+                f"Regime flip -> {'BULL' if bull else 'BEAR'} "
+                f"(spot={snap.get('spot', 0):.2f}, sma={snap.get('sma', 0):.2f})",
+                "INFO" if bull else "WARNING",
+            )
+        self._last_regime_bull = bull
+        if not bull:
             self._push_state()
             return
 
